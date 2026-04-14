@@ -1,0 +1,4 @@
+# Ignore folders
+downloads/
+shared_files/
+__pycache__/

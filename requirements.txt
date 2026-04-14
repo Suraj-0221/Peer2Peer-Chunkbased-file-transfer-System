@@ -1,0 +1,6 @@
+# P2P File Sharing Application Requirements
+# This application uses only Python standard library modules
+# Tkinter comes built-in with Python
+
+# For creating executable (.exe) file on Windows:
+pyinstaller>=6.0.0

@@ -53,11 +53,15 @@ class Tracker:
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.server_socket.bind((self.host, self.port))
-            self.server_socket.listen(MAX_CLIENTS)
+            self.server_socket.listen(100)
             self.running = True
             
             print(f"[TRACKER] Server started on {self.host}:{self.port}")
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Waiting for peer connections...")
+            
+            # Start cleanup daemon thread
+            cleanup_thread = threading.Thread(target=self.cleanup_stale_peers, daemon=True)
+            cleanup_thread.start()
             
             while self.running:
                 try:
@@ -68,7 +72,7 @@ class Tracker:
                     peer_thread = threading.Thread(
                         target=self.handle_peer,
                         args=(client_socket, client_address),
-                        daemon=True
+                        daemon=False  # Don't use daemon, let cleanup happen properly
                     )
                     peer_thread.start()
                 except KeyboardInterrupt:
@@ -80,6 +84,29 @@ class Tracker:
             print(f"[ERROR] Tracker startup failed: {e}")
         finally:
             self.stop()
+    
+    def cleanup_stale_peers(self):
+        """Remove peers that haven't sent heartbeat in 120 seconds"""
+        while self.running:
+            try:
+                threading.Event().wait(30)  # Check every 30 seconds
+                current_time = time.time()
+                with self.lock:
+                    stale_peers = []
+                    for peer_id, info in self.peers.items():
+                        last_seen = info.get('last_seen', current_time)
+                        if current_time - last_seen > 120:
+                            stale_peers.append(peer_id)
+                    
+                    for peer_id in stale_peers:
+                        del self.peers[peer_id]
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] Removed stale peer: {peer_id} (no heartbeat for 120s)")
+                    
+                    if stale_peers:
+                        active_count = len(self.peers)
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] Active peers: {active_count}")
+            except Exception as e:
+                print(f"[ERROR] Cleanup thread error: {e}")
     
     def handle_peer(self, client_socket, client_address):
         """Handle communication with a peer"""
@@ -100,7 +127,8 @@ class Tracker:
                         self.peers[peer_id] = {
                             'host': client_address[0],
                             'port': message['port'],
-                            'files': {}
+                            'files': {},
+                            'last_seen': time.time()
                         }
                     print(f"[{datetime.now().strftime('%H:%M:%S')}] Peer registered: {peer_id}")
                     client_socket.send(json.dumps({'status': 'registered', 'peer_id': peer_id}).encode('utf-8'))
@@ -109,30 +137,34 @@ class Tracker:
                     if peer_id:
                         with self.lock:
                             self.peers[peer_id]['files'] = message.get('files', {})
+                            self.peers[peer_id]['last_seen'] = time.time()
                         print(f"[{datetime.now().strftime('%H:%M:%S')}] Files updated for {peer_id}: {list(message.get('files', {}).keys())}")
                         client_socket.send(json.dumps({'status': 'files_updated'}).encode('utf-8'))
                 
                 elif command == 'get_peers':
-                    # Return list of all peers with their files
+                    # Return list of all active peers with their files
                     with self.lock:
                         peers_info = {}
                         for pid, info in self.peers.items():
-                            peers_info[pid] = {
-                                'host': info['host'],
-                                'port': info['port'],
-                                'files': info['files']
-                            }
+                            # Skip peers that haven't been seen in 2 minutes (possibly dead)
+                            if time.time() - info.get('last_seen', 0) < 120:
+                                peers_info[pid] = {
+                                    'host': info['host'],
+                                    'port': info['port'],
+                                    'files': info['files']
+                                }
                         # Log what we're sending
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] Returning peers: {len(peers_info)} peers")
-                        for peer_id, peer_data in peers_info.items():
-                            print(f"     {peer_id}: {list(peer_data.get('files', {}).keys())}")
+                        active_peers = len(peers_info)
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] Peer list requested by {peer_id} - Returning {active_peers} active peers")
+                        for p_id, p_data in peers_info.items():
+                            file_count = len(p_data.get('files', {}))
+                            print(f"     {p_id}: {file_count} file(s)")
                     client_socket.send(json.dumps({'status': 'peers', 'peers': peers_info}).encode('utf-8'))
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Peer list requested by {peer_id}")
                 
                 elif command == 'heartbeat':
                     # Keep-alive ping from peer
                     with self.lock:
-                        if peer_id in self.peers:
+                        if peer_id and peer_id in self.peers:
                             self.peers[peer_id]['last_seen'] = time.time()
                     client_socket.send(json.dumps({'status': 'pong'}).encode('utf-8'))
                     
@@ -148,6 +180,7 @@ class Tracker:
                 with self.lock:
                     if peer_id in self.peers:
                         del self.peers[peer_id]
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] Peer disconnected: {peer_id}")
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Peer disconnected: {peer_id}")
             client_socket.close()
     

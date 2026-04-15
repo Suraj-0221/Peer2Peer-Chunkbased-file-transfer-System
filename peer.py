@@ -69,6 +69,9 @@ class PeerClient:
         self.files_listbox = None
         self.download_progress = None
         self.status_label = None
+        
+        # Scan existing files in shared folder on startup
+        self.rescan_shared_folder()
     
     @staticmethod
     def find_available_port(start_port=5001):
@@ -84,6 +87,31 @@ class PeerClient:
             except OSError:
                 port += 1
         raise Exception(f"Could not find available port starting from {start_port}")
+    
+    def rescan_shared_folder(self):
+        """Scan shared_files folder and populate shared_files dict"""
+        try:
+            if self.shared_folder.exists():
+                with self.lock:
+                    self.shared_files.clear()
+                    for file_path in self.shared_folder.iterdir():
+                        if file_path.is_file():
+                            file_size = file_path.stat().st_size
+                            self.shared_files[file_path.name] = file_size
+                
+                if self.shared_files:
+                    self.log(f"Found {len(self.shared_files)} existing file(s) in shared folder")
+                    for filename, size in self.shared_files.items():
+                        self.log(f"  - {filename} ({self.format_size(size)})")
+        except Exception as e:
+            self.log(f"Error scanning shared folder: {e}")
+    
+    def rescan_and_update(self):
+        """Rescan shared folder and update tracker with new file list"""
+        self.rescan_shared_folder()
+        self.update_tracker_files()
+        self.log(f"Shared folder rescanned - reporting {len(self.shared_files)} file(s) to tracker")
+        messagebox.showinfo("Rescan Complete", f"Found {len(self.shared_files)} file(s) in shared folder")
         
     def log(self, message):
         """Add message to log with timestamp"""
@@ -118,6 +146,12 @@ class PeerClient:
                 self.running = True
                 self.start_file_server()
                 self.start_heartbeat()
+                
+                # Send all shared files to tracker immediately after registration
+                import time
+                time.sleep(0.5)  # Brief delay to ensure connection is ready
+                self.update_tracker_files()
+                
                 return True
         except Exception as e:
             self.log(f"Failed to connect to tracker: {e}")
@@ -127,31 +161,54 @@ class PeerClient:
     def start_file_server(self):
         """Start a socket server to serve files to other peers"""
         def server_thread():
+            active_connections = 0
+            max_active = 20  # Limit concurrent connections
             try:
                 self.file_server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.file_server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 self.file_server_socket.bind(('0.0.0.0', self.file_server_port))
-                self.file_server_socket.listen(10)
+                self.file_server_socket.listen(20)  # Increased listen backlog
                 self.log(f"File server started on port {self.file_server_port}")
                 
                 while self.running:
                     try:
                         client_socket, client_address = self.file_server_socket.accept()
                         
+                        # Limit concurrent connections to prevent resource exhaustion
+                        active_connections += 1
+                        if active_connections > max_active:
+                            self.log(f"⚠ Connection limit reached ({active_connections}), rejecting new connection")
+                            client_socket.close()
+                            active_connections -= 1
+                            continue
+                        
                         # Handle file request in separate thread
+                        def handle_with_cleanup(sock, addr, conn_count):
+                            try:
+                                self.handle_file_request(sock, addr)
+                            finally:
+                                nonlocal active_connections
+                                active_connections -= 1
+                        
                         handler = threading.Thread(
-                            target=self.handle_file_request,
-                            args=(client_socket, client_address),
-                            daemon=True
+                            target=handle_with_cleanup,
+                            args=(client_socket, client_address, active_connections),
+                            daemon=False  # Changed to False to ensure cleanup
                         )
                         handler.start()
-                    except:
+                    except Exception as e:
                         if self.running:
-                            pass
+                            self.log(f"Error accepting connection: {e}")
                         else:
                             break
             except Exception as e:
                 self.log(f"File server error: {e}")
+            finally:
+                try:
+                    if self.file_server_socket:
+                        self.file_server_socket.close()
+                except:
+                    pass
         
         t = threading.Thread(target=server_thread, daemon=True)
         t.start()
@@ -159,42 +216,102 @@ class PeerClient:
     def handle_file_request(self, client_socket, client_address):
         """Handle incoming file requests from other peers"""
         try:
-            # Receive file request
-            request = json.loads(client_socket.recv(4096).decode('utf-8'))
+            # Set socket timeouts and buffers for reliable transfer
+            client_socket.settimeout(120)  # 2 minute timeout for slow networks
+            client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)  # 256KB
+            client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)  # 256KB
+            
+            # Receive file request with length prefix
+            request_len_bytes = client_socket.recv(4)
+            if not request_len_bytes or len(request_len_bytes) < 4:
+                return
+            
+            request_len = int.from_bytes(request_len_bytes, 'big')
+            if request_len > 10000:  # Sanity check
+                self.log(f"Invalid request length from {client_address}: {request_len}")
+                return
+                
+            request_data = b''
+            while len(request_data) < request_len:
+                chunk = client_socket.recv(request_len - len(request_data))
+                if not chunk:
+                    break
+                request_data += chunk
+            
+            request = json.loads(request_data.decode('utf-8'))
             filename = request.get('filename')
             chunk_index = request.get('chunk_index', 0)
             
-            if filename not in self.shared_files:
+            if not filename or filename not in self.shared_files:
                 response = {'status': 'error', 'message': 'file_not_found'}
-                client_socket.send(json.dumps(response).encode('utf-8'))
+                response_json = json.dumps(response).encode('utf-8')
+                try:
+                    client_socket.sendall(len(response_json).to_bytes(4, 'big'))
+                    client_socket.sendall(response_json)
+                except:
+                    pass
                 return
             
             file_path = self.shared_folder / filename
             
             if not file_path.exists():
                 response = {'status': 'error', 'message': 'file_not_found'}
-                client_socket.send(json.dumps(response).encode('utf-8'))
+                response_json = json.dumps(response).encode('utf-8')
+                try:
+                    client_socket.sendall(len(response_json).to_bytes(4, 'big'))
+                    client_socket.sendall(response_json)
+                except:
+                    pass
                 return
             
             # Read and send file chunk
-            with open(file_path, 'rb') as f:
-                f.seek(chunk_index * CHUNK_SIZE)
-                chunk_data = f.read(CHUNK_SIZE)
+            try:
+                with open(file_path, 'rb') as f:
+                    f.seek(chunk_index * CHUNK_SIZE)
+                    chunk_data = f.read(CHUNK_SIZE)
+                    
+                    response = {
+                        'status': 'success',
+                        'filename': filename,
+                        'chunk_index': chunk_index,
+                        'chunk_size': len(chunk_data),
+                        'is_last': len(chunk_data) < CHUNK_SIZE
+                    }
+                    
+                    # Send response with length prefix
+                    response_json = json.dumps(response).encode('utf-8')
+                    response_len = len(response_json)
+                    
+                    # Send: [4 bytes length][JSON header][binary chunk]
+                    client_socket.sendall(response_len.to_bytes(4, 'big'))
+                    client_socket.sendall(response_json)
+                    
+                    # Send binary data in smaller chunks to avoid socket buffer issues
+                    bytes_sent = 0
+                    while bytes_sent < len(chunk_data):
+                        to_send = min(32768, len(chunk_data) - bytes_sent)
+                        client_socket.sendall(chunk_data[bytes_sent:bytes_sent + to_send])
+                        bytes_sent += to_send
+                    
+                    self.log(f"Sent chunk {chunk_index + 1} of '{filename}' to {client_address[0]}")
+            except socket.timeout:
+                self.log(f"Socket timeout sending chunk {chunk_index} to {client_address}")
+            except Exception as send_err:
+                self.log(f"Error sending chunk {chunk_index}: {send_err}")
                 
-                response = {
-                    'status': 'success',
-                    'filename': filename,
-                    'chunk_size': len(chunk_data),
-                    'is_last': len(chunk_data) < CHUNK_SIZE
-                }
-                
-                client_socket.send(json.dumps(response).encode('utf-8'))
-                client_socket.sendall(chunk_data)
-                
+        except socket.timeout:
+            self.log(f"Timeout in file request handler from {client_address}")
         except Exception as e:
             self.log(f"File request handler error: {e}")
         finally:
-            client_socket.close()
+            try:
+                client_socket.shutdown(socket.SHUT_RDWR)
+            except:
+                pass
+            try:
+                client_socket.close()
+            except:
+                pass
     
     def start_heartbeat(self):
         """Send periodic heartbeat to tracker"""
@@ -226,19 +343,30 @@ class PeerClient:
             file_path = Path(file_path)
             file_size = file_path.stat().st_size
             
-            # Copy file to shared folder
+            # Copy file to shared folder with verified integrity
             dest_path = self.shared_folder / file_path.name
             
-            # Copy file (allow duplicate filenames - multiple seeders for same file)
+            # Copy file in chunks to handle large files
             with open(file_path, 'rb') as src:
                 with open(dest_path, 'wb') as dst:
-                    dst.write(src.read())
+                    bytes_copied = 0
+                    while True:
+                        chunk = src.read(1024 * 1024)  # 1MB chunks
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+                        bytes_copied += len(chunk)
+            
+            # Verify file was copied correctly
+            dest_size = dest_path.stat().st_size
+            if dest_size != file_size:
+                raise Exception(f"File copy failed: source {file_size} bytes, copied {dest_size} bytes")
             
             # Update shared files
             with self.lock:
                 self.shared_files[file_path.name] = file_size
             
-            self.log(f"File uploaded: {file_path.name} ({self.format_size(file_size)})")
+            self.log(f"File uploaded: {file_path.name} ({self.format_size(file_size)}) - Verified OK")
             
             # Update tracker with new file list
             self.update_tracker_files()
@@ -248,6 +376,51 @@ class PeerClient:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to upload file: {e}")
             self.log(f"Upload failed: {e}")
+    
+    def add_file_to_sharing(self, source_path):
+        """Add a file to the shared_files folder and update tracker"""
+        try:
+            source_path = Path(source_path)
+            if not source_path.exists():
+                self.log(f"File not found: {source_path}")
+                return False
+            
+            dest_path = self.shared_folder / source_path.name
+            
+            # If file is already in shared folder, no need to copy
+            if source_path.resolve() == dest_path.resolve():
+                with self.lock:
+                    if source_path.name not in self.shared_files:
+                        self.shared_files[source_path.name] = source_path.stat().st_size
+            else:
+                # Copy file to shared folder
+                file_size = source_path.stat().st_size
+                with open(source_path, 'rb') as src:
+                    with open(dest_path, 'wb') as dst:
+                        while True:
+                            chunk = src.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            dst.write(chunk)
+                
+                # Verify copy
+                if dest_path.stat().st_size != file_size:
+                    raise Exception(f"Copy verification failed")
+                
+                with self.lock:
+                    self.shared_files[source_path.name] = file_size
+                
+                self.log(f"Copied '{source_path.name}' to shared folder")
+            
+            # Update tracker
+            self.update_tracker_files()
+            self.log(f"✓ Now seeding '{source_path.name}'")
+            return True
+            
+        except Exception as e:
+            self.log(f"Failed to add file to sharing: {e}")
+            messagebox.showerror("Error", f"Could not add file to sharing: {e}")
+            return False
     
     def update_tracker_files(self):
         """Update tracker with current shared files"""
@@ -397,47 +570,140 @@ class PeerClient:
             file_dest = download_path / filename
             chunks_data = {}
             chunks_lock = threading.Lock()
+            failed_chunks = set()
             
-            # Create empty file
+            # Create empty file with proper size (filled with zeros)
             with open(file_dest, 'wb') as f:
                 f.write(b'\x00' * file_size)
             
-            def download_chunk(chunk_index, peer_id, peer_host, peer_port):
-                """Download a specific chunk from a peer"""
+            def download_chunk(chunk_index, peer_id, peer_host, peer_port, retry_count=0):
+                """Download a specific chunk from a peer with robust retry logic"""
+                max_retries = 5  # Increased from 3 to 5
+                peer_socket = None
                 try:
+                    # Exponential backoff: wait longer between retries
+                    if retry_count > 0:
+                        wait_time = min(2 ** retry_count, 30)  # Max 30 seconds wait
+                        self.log(f"Waiting {wait_time}s before retrying chunk {chunk_index + 1}/{total_chunks}...")
+                        import time
+                        time.sleep(wait_time)
+                    
                     peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    # Increase timeout and set buffer sizes
+                    peer_socket.settimeout(60)  # 60 second timeout (was 30)
+                    peer_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)  # 256KB buffer
+                    peer_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)  # 256KB buffer
+                    
                     peer_socket.connect((peer_host, peer_port))
                     
                     request = {
                         'filename': filename,
                         'chunk_index': chunk_index
                     }
-                    peer_socket.send(json.dumps(request).encode('utf-8'))
+                    request_json = json.dumps(request).encode('utf-8')
                     
-                    response = json.loads(peer_socket.recv(4096).decode('utf-8'))
+                    # Send request with length prefix: [4 bytes length][JSON]
+                    request_len = len(request_json)
+                    peer_socket.sendall(request_len.to_bytes(4, 'big'))
+                    peer_socket.sendall(request_json)
+                    
+                    # Receive response header length (first 4 bytes)
+                    response_len_bytes = b''
+                    while len(response_len_bytes) < 4:
+                        chunk = peer_socket.recv(4 - len(response_len_bytes))
+                        if not chunk:
+                            raise Exception("Connection closed: peer didn't send response length")
+                        response_len_bytes += chunk
+                    
+                    response_len = int.from_bytes(response_len_bytes, 'big')
+                    if response_len > 10000:  # Sanity check - JSON should be < 1KB
+                        raise Exception(f"Invalid response length: {response_len} bytes (corrupted header)")
+                    
+                    # Receive exact amount of JSON response data
+                    response_data = b''
+                    while len(response_data) < response_len:
+                        try:
+                            chunk = peer_socket.recv(response_len - len(response_data))
+                        except socket.timeout:
+                            raise Exception(f"Timeout receiving response header at {len(response_data)}/{response_len} bytes")
+                        if not chunk:
+                            raise Exception(f"Connection closed during response: got {len(response_data)}/{response_len} bytes")
+                        response_data += chunk
+                    
+                    response = json.loads(response_data.decode('utf-8'))
                     
                     if response.get('status') == 'success':
-                        chunk_data = b''
                         chunk_size = response.get('chunk_size', 0)
-                        
-                        # Receive chunk data
-                        while len(chunk_data) < chunk_size:
-                            data = peer_socket.recv(min(16384, chunk_size - len(chunk_data)))
-                            if not data:
-                                break
-                            chunk_data += data
-                        
-                        with chunks_lock:
-                            chunks_data[chunk_index] = chunk_data
+                        if chunk_size == 0:
+                            # Empty chunk might be end of file
+                            self.log(f"Downloaded empty chunk {chunk_index + 1}/{total_chunks} (EOF)")
+                            with chunks_lock:
+                                chunks_data[chunk_index] = b''
+                                if chunk_index in failed_chunks:
+                                    failed_chunks.discard(chunk_index)
+                        else:
+                            # Receive binary chunk data (exactly chunk_size bytes)
+                            chunk_data = b''
+                            timeout_count = 0
+                            while len(chunk_data) < chunk_size:
+                                try:
+                                    data = peer_socket.recv(min(32768, chunk_size - len(chunk_data)))
+                                except socket.timeout:
+                                    timeout_count += 1
+                                    if timeout_count > 3:
+                                        raise Exception(f"Multiple timeouts receiving chunk data. Got {len(chunk_data)}/{chunk_size} bytes")
+                                    self.log(f"Timeout on chunk {chunk_index + 1} (got {len(chunk_data)}/{chunk_size}), retrying...")
+                                    continue
+                                
+                                if not data:
+                                    raise Exception(f"Connection lost while downloading chunk {chunk_index}. Got {len(chunk_data)}/{chunk_size} bytes")
+                                chunk_data += data
+                            
+                            if len(chunk_data) != chunk_size:
+                                raise Exception(f"Chunk size mismatch: expected {chunk_size}, got {len(chunk_data)}")
+                            
+                            with chunks_lock:
+                                chunks_data[chunk_index] = chunk_data
+                                if chunk_index in failed_chunks:
+                                    failed_chunks.discard(chunk_index)
                         
                         progress_pct = int((len(chunks_data) / total_chunks) * 100)
                         self.update_progress(progress_pct)
-                        self.log(f"Downloaded chunk {chunk_index + 1}/{total_chunks} from {peer_id}")
+                        self.log(f"✓ Downloaded chunk {chunk_index + 1}/{total_chunks} from {peer_id}")
+                    else:
+                        error_msg = response.get('message', 'Unknown error')
+                        raise Exception(f"Peer error: {error_msg}")
                     
                     peer_socket.close()
                     
                 except Exception as e:
-                    self.log(f"Chunk download error (chunk {chunk_index}): {e}")
+                    if peer_socket:
+                        try:
+                            peer_socket.close()
+                        except:
+                            pass
+                    
+                    with chunks_lock:
+                        failed_chunks.add(chunk_index)
+                    
+                    if retry_count < max_retries:
+                        self.log(f"⚠ Chunk {chunk_index + 1}/{total_chunks} failed (attempt {retry_count + 1}/{max_retries + 1}): {str(e)[:80]}")
+                        # Try next available peer
+                        try:
+                            peer_idx = (peers_with_file.index((peer_id, file_size)) + 1) % len(peers_with_file)
+                            next_peer_id, _ = peers_with_file[peer_idx]
+                            host_port = next_peer_id.split(':')
+                            next_host = host_port[0]
+                            next_port = int(host_port[1]) if len(host_port) > 1 else self.file_server_port
+                            threading.Thread(
+                                target=download_chunk,
+                                args=(chunk_index, next_peer_id, next_host, next_port, retry_count + 1),
+                                daemon=True
+                            ).start()
+                        except Exception as retry_err:
+                            self.log(f"Could not retry chunk {chunk_index + 1}: {retry_err}")
+                    else:
+                        self.log(f"✗ FAILED chunk {chunk_index + 1}/{total_chunks} after {max_retries + 1} attempts")
             
             # Get peer host and port info
             peers_info = {}
@@ -474,16 +740,47 @@ class PeerClient:
             for thread in active_threads:
                 thread.join()
             
-            # Write chunks to file in order
-            with open(file_dest, 'wb') as f:
+            # Final wait for any remaining retry threads
+            import time
+            max_wait = 60  # Wait up to 60 seconds for retries
+            wait_time = 0
+            while len(chunks_data) < total_chunks and wait_time < max_wait:
+                time.sleep(0.5)
+                wait_time += 0.5
+            
+            # Write chunks to file at correct offsets
+            with open(file_dest, 'r+b') as f:
                 for chunk_idx in range(total_chunks):
                     if chunk_idx in chunks_data:
+                        f.seek(chunk_idx * CHUNK_SIZE)
                         f.write(chunks_data[chunk_idx])
+                    elif chunk_idx not in failed_chunks:
+                        self.log(f"Warning: Chunk {chunk_idx + 1}/{total_chunks} not downloaded")
+                    else:
+                        self.log(f"Error: Chunk {chunk_idx + 1}/{total_chunks} failed to download")
             
-            self.log(f"Download complete: {filename}")
-            self.update_progress(100)
-            download_path = Path('downloads').resolve()
-            messagebox.showinfo("Success", f"File '{filename}' downloaded successfully!\n\nLocation: {download_path / filename}")
+            # Verify file completeness
+            final_size = file_dest.stat().st_size
+            if final_size != file_size:
+                self.log(f"WARNING: Downloaded file size ({self.format_size(final_size)}) does not match expected size ({self.format_size(file_size)})")
+            
+            if failed_chunks:
+                self.log(f"Download incomplete: {len(failed_chunks)} chunk(s) failed to download")
+                messagebox.showwarning("Download Incomplete", f"File downloaded but {len(failed_chunks)} chunk(s) failed.\n\nFile: {file_dest}\nSize: {self.format_size(final_size)}")
+            else:
+                self.log(f"Download complete: {filename} ({self.format_size(final_size)})")
+                self.update_progress(100)
+                
+                # Ask if user wants to share this file
+                result = messagebox.askyesno(
+                    "Download Complete",
+                    f"File '{filename}' downloaded successfully!\n\nLocation: {file_dest.resolve()}\n\nDo you want to share this file with other peers?"
+                )
+                
+                if result:
+                    # Auto-add to sharing
+                    self.add_file_to_sharing(file_dest.resolve())
+                    self.log(f"★ File '{filename}' is now being shared as a seeder!")
             
         except Exception as e:
             messagebox.showerror("Download Error", f"Failed to download file: {e}")
@@ -541,6 +838,9 @@ class PeerClient:
         
         upload_btn = ttk.Button(button_frame, text="📤 Upload File", command=self.upload_file)
         upload_btn.pack(side=tk.LEFT, padx=5)
+        
+        rescan_btn = ttk.Button(button_frame, text="🔍 Rescan Folder", command=self.rescan_and_update)
+        rescan_btn.pack(side=tk.LEFT, padx=5)
         
         refresh_btn = ttk.Button(button_frame, text="🔄 Refresh Files", command=self.refresh_files)
         refresh_btn.pack(side=tk.LEFT, padx=5)
